@@ -61,6 +61,29 @@ class rx_lora_base_engine(gr.top_block):
         samp_rate = int(samp_rate)
         lora_bw = int(lora_bw)
         sync_word = [int(x) for x in sync_word]
+
+        # --- HackRF-specific workarounds ---
+        # HackRF is a direct-conversion (zero-IF) receiver with two quirks
+        # that break LoRa decoding when the flowgraph is tuned for RTL-SDR:
+        #
+        # 1. Minimum sample rate: HackRF hardware ignores requests below
+        #    2 Msps and silently clocks at 2 Msps regardless. GNU Radio
+        #    then believes it is operating at the requested (lower) rate,
+        #    so every FFT window and chip-timing calculation is wrong,
+        #    causing 100 % CRC failure. Fix: enforce 2 Msps minimum.
+        #
+        # 2. DC spike: direct-conversion mixers produce a strong DC
+        #    component at the exact tuned frequency. LoRa chirps sweep
+        #    through 0 Hz on every symbol, so the spike corrupts the FFT
+        #    bin at the centre of each chirp. Fix: offset-tune the hardware
+        #    500 kHz above the target and compensate in the freq_xlating
+        #    filter so the DC spike falls outside the LoRa passband.
+        is_hackrf = "hackrf" in str(device_args).lower()
+        if is_hackrf:
+            samp_rate = max(samp_rate, 2_000_000)
+            dc_shift = 500_000
+        else:
+            dc_shift = 0
         self.sync_word = sync_word
         self.soft_decoding = soft_decoding = True
         sf = int(sf)
@@ -88,10 +111,13 @@ class rx_lora_base_engine(gr.top_block):
         self.rtlsdr_source_0.set_time_source('external', 0)
         self.rtlsdr_source_0.set_time_unknown_pps(osmosdr.time_spec_t())
         self.rtlsdr_source_0.set_sample_rate(samp_rate)
-        self.rtlsdr_source_0.set_center_freq(center_freq, 0)
+        self.rtlsdr_source_0.set_center_freq(center_freq + dc_shift, 0)
         self.rtlsdr_source_0.set_freq_corr(ppm, 0)
-        self.rtlsdr_source_0.set_dc_offset_mode(0, 0)
-        self.rtlsdr_source_0.set_iq_balance_mode(0, 0)
+        # HackRF benefits from automatic software DC/IQ correction;
+        # leave RTL-SDR at its original settings (mode 0).
+        dc_iq_mode = 2 if is_hackrf else 0
+        self.rtlsdr_source_0.set_dc_offset_mode(dc_iq_mode, 0)
+        self.rtlsdr_source_0.set_iq_balance_mode(dc_iq_mode, 0)
         self.rtlsdr_source_0.set_gain_mode(False, 0)
         self.rtlsdr_source_0.set_gain(gain, 0)
         self.rtlsdr_source_0.set_if_gain(int(if_gain), 0)
@@ -107,7 +133,7 @@ class rx_lora_base_engine(gr.top_block):
         self.lora_sdr_dewhitening_0_1 = lora_sdr.dewhitening()
         self.lora_sdr_deinterleaver_0_1 = lora_sdr.deinterleaver( soft_decoding)
         self.lora_sdr_crc_verif_0_1 = lora_sdr.crc_verif( 2, False)
-        self.freq_xlating_fir_filter_xxx_0 = filter.freq_xlating_fir_filter_ccc((max(1, int(samp_rate/(lora_bw * 4)))), bandpass250k, 0, samp_rate)
+        self.freq_xlating_fir_filter_xxx_0 = filter.freq_xlating_fir_filter_ccc((max(1, int(samp_rate/(lora_bw * 4)))), bandpass250k, -dc_shift, samp_rate)
         self.freq_xlating_fir_filter_xxx_0.set_min_output_buffer(17000)
         self.epy_block_2 = epy_block_2.blk()
         self.epy_block_1 = epy_block_1.blk()
