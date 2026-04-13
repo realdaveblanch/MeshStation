@@ -44,7 +44,7 @@ KEEP_FILES=(
   "lib/libthrift.0.22.0.dylib"
   "lib/libuhd.4.9.0.dylib"
   "lib/libusb-1.0.0.dylib"
-  "lib/libvolk.3.2.dylib"
+  "lib/libvolk.3.3.dylib"
   "lib/libvorbis.0.4.9.dylib"
   "lib/libvorbisenc.2.0.12.dylib"
   "lib/libbz2.dylib"
@@ -94,7 +94,7 @@ KEEP_FILES=(
   "lib/libfmt.12.dylib"
   "lib/libgmp.10.dylib"
   "lib/libgnuradio-runtime.3.10.12.dylib"
-  "lib/libspdlog.1.16.dylib"
+  "lib/libspdlog.1.17.dylib"
   "lib/libgnuradio-lora_sdr.1.0.0git.dylib"
   "lib/libgnuradio-network.3.10.12.dylib"
   "lib/libgnuradio-pdu.3.10.12.dylib"
@@ -134,13 +134,7 @@ download_micromamba_if_needed() {
 build_env() {
   echo "Building the environment..."
   "$MM" create -p "$ENV_PATH" -c conda-forge -c ryanvolz \
-    nomkl \
-    python=3.10 \
-    gnuradio-osmosdr \
-    gnuradio-lora_sdr \
-    rtl-sdr \
-    libusb \
-    numpy \
+    --file "./lock-macos-$(uname -m).yml" \
     --yes
 }
 
@@ -353,3 +347,12 @@ clean_micromamba_cache
 echo "Done."
 
 echo "Done, now you can use the internal radio of the app."
+
+# Note dev to recreate the lock file (only after testing on libraries to be excluded)
+# Create our basic env with:
+# ./micromamba create -f linuxenv.yml -p ./runtime
+# (which is not a lock file)
+# Then create the lock file with:
+# ./micromamba env export -p ./runtime > lock-macos-arm64.yml
+# Then open the file and remove the entire "pip" section if present (contamination) 
+#   with all the contents, also remove "prefix" and put "runtime" as the name, save, done.

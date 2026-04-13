@@ -109,7 +109,7 @@ KEEP_FILES=(
   # Misc libraries
   "lib/libfmt.so.12"
   "lib/libgmp.so.10"
-  "lib/libspdlog.so.1.16"
+  "lib/libspdlog.so.1.17"
   "lib/libthrift.so.0.22.0"
   "lib/libunwind.so.8"
   
@@ -147,7 +147,7 @@ KEEP_FILES=(
   lib/libstdc++.so.6"
   "lib/libstdc++.so.6.0.34"
   "lib/liborc-0.4.so.0"
-  "lib/libvolk.so.3.2"
+  "lib/libvolk.so.3.3"
 
   # GNU Radio core libraries (full versions - actual files)
   "lib/libgnuradio-analog.so.3.10.12.0"
@@ -210,13 +210,7 @@ download_micromamba_if_needed() {
 build_env() {
   echo "Building the environment..."
   "$MM" create -p "$ENV_PATH" -c conda-forge -c ryanvolz \
-    nomkl \
-    python=3.10 \
-    gnuradio-osmosdr \
-    gnuradio-lora_sdr \
-    rtl-sdr \
-    libusb \
-    numpy \
+    --file "./lock-linux-$(uname -m).yml" \
     --yes
 }
 
@@ -421,3 +415,12 @@ echo "Cleaning micromamba cache..."
 clean_micromamba_cache
 
 echo "Done. Runtime environment ready at: $ENV_PATH"
+
+# Note dev to recreate the lock file (only after testing on libraries to be excluded)
+# Create our basic env with:
+# ./micromamba create -f linuxenv.yml -p ./runtime
+# (which is not a lock file)
+# Then create the lock file with:
+# ./micromamba env export -p ./runtime > lock-linux-aarch64.yml
+# Then open the file and remove the entire "pip" section if present (contamination) 
+#   with all the contents, also remove "prefix" and put "runtime" as the name, save, done.

@@ -16,8 +16,7 @@ set /p input="Type 'ok' to continue or close the script: "
 REM check if the input is 'ok' (case insensitive)
 if /i not "%input%"=="ok" (
     echo Input is not 'ok', closing the script...
-    pause
-    exit
+    goto :endscript
 )
 
 REM if ok
@@ -29,7 +28,7 @@ if not exist micromamba.exe (
     if errorlevel 1 (
         echo Download failed! Please download micromamba manually and place it in this folder.
         pause
-        exit
+        goto :endscript
     )
     echo 1.1 micromamba downloaded successfully, proceeding...
 ) else (
@@ -37,24 +36,48 @@ if not exist micromamba.exe (
 )
 
 echo 2. Building the environment...
+if exist "%ENV_PATH%" (
+    echo Environment already exists.
+    echo 1^) Delete and recreate
+    echo 2^) Skip creation and run cleanup only
+    echo 3^) Abort and exit
+    setlocal enabledelayedexpansion
+    set /p choice="Choose (1, 2 or 3): "
+    if "!choice!"=="1" (
+        endlocal
+        rd /s /q "%ENV_PATH%" 2>nul
+        goto :build_env
+    ) else if "!choice!"=="2" (
+        endlocal
+        echo Skipping creation, proceeding to cleanup...
+        goto :cleanup
+    ) else if "!choice!"=="3" (
+        endlocal
+        echo Aborted.
+        goto :endscript
+    ) else (
+        echo Invalid choice. Aborted.
+        endlocal
+        goto :endscript
+    )
+) else (
+    goto :build_env
+)
+
+:build_env
 micromamba create -p %ENV_PATH% -c conda-forge -c ryanvolz ^
-  nomkl ^
-  python=3.10 ^
-  gnuradio-osmosdr ^
-  gnuradio-lora_sdr ^
-  rtl-sdr ^
-  libusb ^
-  numpy ^
+  --file "lock-win-x86_64.yml" ^
   --yes
 
-echo 3. testing the environment...
+echo 3. Testing the environment...
 %ENV_PATH%\python -c "import gnuradio, pmt, osmosdr, numpy; import gnuradio.lora_sdr as l; print('OK')" || (
-    echo 3.1 Test failed, open an issue on GitHub and report the error, closing the script...
-    pause
-    exit
+    echo Test failed, open an issue on GitHub and report the error, closing the script...
+    goto :endscript
 )
 
 echo Test passed, proceeding with cleanup...
+
+:cleanup
 
 echo --- Cleaning up of the %ENV_PATH% folder ---
 
@@ -262,9 +285,27 @@ if exist "%ENV_PATH%" (
       "}"
 )
 
+echo Re-testing after cleanup...
+%ENV_PATH%\python -c "import gnuradio, pmt, osmosdr, numpy; import gnuradio.lora_sdr as l; print('OK')" || (
+    echo Post-cleanup test failed! The pruning may have removed required files.
+    echo Open an issue on GitHub and report the error.
+    goto :endscript
+)
+echo Post-cleanup test passed.
+
 echo Bonus: Clear cache to free up space on your PC
 echo Cleaning cache Micromamba...
 micromamba clean --all --yes
 
 echo Done, now you can use the internal radio of the app.
+:endscript
 pause
+
+REM # Note dev to recreate the lock file (only after testing on libraries to be excluded)
+REM # Create our basic env with:
+REM # ./micromamba.exe create -f linuxenv.yml -p ./runtime
+REM # (which is not a lock file)
+REM # Then create the lock file with:
+REM # ./micromamba.exe env export -p ./runtime > lock-win-x86_64.yml
+REM # Then open the file and remove the entire "pip" section if present (contamination) 
+REM #   with all the contents, also remove "prefix" and put "runtime" as the name, save, done.

@@ -42,11 +42,11 @@ from fastapi import Request
 PROGRAM_NAME = "MeshStation"
 PROGRAM_SHORT_DESC = "Meshtastic SDR Analyzer & Desktop GUI"
 AUTHOR = "IronGiu"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 LICENSE = "GNU General Public License v3.0"
 GITHUB_URL = "https://github.com/IronGiu/MeshStation"
 DONATION_URL = "https://ko-fi.com/irongiu"
-SUPPORTERS_URL = "https://github.com/IronGiu/MeshStation/SUPPORTERS.md"
+SUPPORTERS_URL = "https://github.com/IronGiu/MeshStation/blob/main/SUPPORTERS.md"
 GITHUB_RELEASES_URL = f"{GITHUB_URL}/releases"
 LANG_FILE_NAME = "languages.json"
 # --- CLI argument parsing ---
@@ -64,6 +64,15 @@ def _parse_args():
         "--debug", action="store_true",
         help="Enable debug mode (verbose logging)"
     )
+    parser.add_argument(
+        "--nogpu", action="store_true",
+        help=(
+            "Force software rendering: disable GPU/hardware acceleration. "
+            "Useful on systems without a compatible GPU, inside VMs, or when "
+            "hardware rendering causes crashes. "
+            "Can also be enabled via the environment variable MESHSTATION_NOGPU=1."
+        )
+    )
     args, _ = parser.parse_known_args()
     if args.help:
         parser.print_help()
@@ -79,6 +88,50 @@ MAIN_LOOP = None
 # Chat Constants
 _CHAT_DOM_WINDOW = 30      # messages visible in the DOM
 _CHAT_LOAD_STEP  = 20      # how many are loaded by pressing "Load more"
+
+# --nogpu: honours both the CLI flag and the env variable MESHSTATION_NOGPU=1.
+# Resolved once at startup so child processes inherit the env vars we set below.
+_NOGPU_REQUESTED = _cli_args.nogpu or (
+    os.environ.get("MESHSTATION_NOGPU", "0").strip() not in ("", "0", "false", "no", "False")
+)
+
+if _NOGPU_REQUESTED:
+    # Use setdefault so we NEVER overwrite vars the user/system already set.
+    os.environ.setdefault("QT_OPENGL", "software")
+    os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
+    os.environ.setdefault("MESA_GL_VERSION_OVERRIDE", "3.3")
+    os.environ.setdefault("MESA_GLSL_VERSION_OVERRIDE", "330")
+    os.environ.setdefault("QT_XCB_GL_INTEGRATION", "none")
+    os.environ.setdefault("QSG_RENDER_LOOP", "basic")
+    os.environ.setdefault("QT_QUICK_BACKEND", "software")
+    _existing = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+    _nogpu_flags = "--disable-gpu --disable-gpu-rasterization --disable-gpu-compositing --no-sandbox"
+    if "--disable-gpu" not in _existing:
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (_existing + " " + _nogpu_flags).strip()
+
+def _attach_windows_console():
+    """
+    Fix console attachment on Windows, ONLY when at least one CLI flag is present.
+    """
+    if os.name != "nt":
+        return
+    if not getattr(sys, "frozen", False):
+        return
+    import ctypes as ctconsole
+    kernel32 = ctconsole.windll.kernel32
+    # Try to attach to parent console first (cmd/powershell)
+    if not kernel32.AttachConsole(-1):
+        # No parent console (or attach failed): allocate a new one
+        kernel32.AllocConsole()
+    # Either way, reopen standard streams on the console
+    sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+    sys.stderr = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+    sys.stdin  = open("CONIN$",  "r", encoding="utf-8", errors="replace")
+    print("", flush=True)
+
+# Attach console early if any CLI flag that produces output is active
+if os.name == "nt" and any(a in sys.argv for a in ("--help", "--debug")):
+    _attach_windows_console()
 
 gc.enable()
 # Optimized thresholds: less frequent cleaning to avoid interrupting the SDR stream
@@ -422,7 +475,7 @@ def ensure_app_icon_file():
                 f.write(APP_ICON_SVG)
     except Exception:
         pass
-
+    
 def setup_static_files():
     maps_dir = get_resource_path('offlinemaps') if getattr(sys, 'frozen', False) else os.path.join(get_app_path(), 'offlinemaps')
     if not os.path.isdir(maps_dir):
@@ -1534,9 +1587,13 @@ def translate(key: str, default: str | None = None) -> str:
     return value
 
 def get_app_path():
+    system = platform.system()
+    exe_dir = os.path.dirname(sys.executable)
+
+    if system == "Linux" and os.environ.get('APPIMAGE'):
+        return os.path.dirname(os.environ.get('APPIMAGE'))
+
     if getattr(sys, 'frozen', False):
-        system = platform.system()
-        exe_dir = os.path.dirname(sys.executable)
         if system == "Darwin":
             contents_dir = os.path.dirname(exe_dir)
             app_dir = os.path.dirname(contents_dir)
@@ -1738,9 +1795,53 @@ def save_user_config():
     except Exception as e:
         log_to_console(f"Config save error: {e}")
 
+def safe_open_url(url):
+    """Open URL in browser with AppImage environment cleaned."""
+    import subprocess
+    clean_env = os.environ.copy()
+    # Remove environment variables that block system processes
+    for var in [
+        "LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONHOME", "GIO_MODULE_DIR",
+        "QT_QPA_PLATFORMTHEME", "QT_QPA_PLATFORM", "QT_PLUGIN_PATH",
+        "QT_OPENGL", "LIBGL_ALWAYS_SOFTWARE", "QTWEBENGINE_CHROMIUM_FLAGS",
+        "QT_LOGGING_RULES", "GSETTINGS_BACKEND", "GDK_BACKEND",
+        "PYWEBVIEW_GUI", "QT_VIDEO_BACKEND",
+    ]:
+        clean_env.pop(var, None)
+    if "SYSTEM_LD_LIBRARY_PATH" in os.environ:
+        clean_env["LD_LIBRARY_PATH"] = os.environ["SYSTEM_LD_LIBRARY_PATH"]
+    
+    try:
+        if platform.system() == "Linux":
+            # Try xdg-open first, then fallback to other openers
+            openers = ["xdg-open", "gio open", "gnome-open", "kde-open", "firefox", "chromium", "xdg-open"]
+            opened = False
+            for opener in ["xdg-open", "gio", "gnome-open", "kde-open5", "kde-open"]:
+                try:
+                    if opener == "gio":
+                        subprocess.Popen(["gio", "open", url], env=clean_env, start_new_session=True)
+                    else:
+                        subprocess.Popen([opener, url], env=clean_env, start_new_session=True)
+                    opened = True
+                    break
+                except FileNotFoundError:
+                    continue
+                except Exception as e:
+                    if DEBUGGING: print(f"DEBUG: {opener} failed: {e}")
+                    continue
+            if not opened:
+                import webbrowser
+                webbrowser.open(url)
+        else:
+            import webbrowser
+            webbrowser.open(url)
+    except Exception as e:
+        if DEBUGGING: print(f"DEBUG: Failed to open URL: {e}")
+
 def check_native_runtime_deps() -> bool:
     import ctypes
     system = platform.system()
+    if DEBUGGING: print(f"DEBUG: Checking deps for {system}")
 
     if system == "Windows":
         win_ver = sys.getwindowsversion()
@@ -1811,6 +1912,7 @@ def check_native_runtime_deps() -> bool:
         return True
 
     if system == "Linux":
+        import shutil
         # Required shared libs for QtWebEngine/Qt backend on Linux (Raspberry etc.)
         required = [
             ("libxcb-cursor.so.0", "libxcb-cursor0"),
@@ -1825,37 +1927,64 @@ def check_native_runtime_deps() -> bool:
                 missing.append((soname, pkg))
 
         if not missing:
+            if DEBUGGING: print("DEBUG: All Linux native deps found.")
             return True
+        
+        # --- Detect distribution and install missing packages ---
+        if shutil.which("dnf"):       # Fedora / RHEL
+            pkg_list = "xcb-util-cursor minizip"
+            install_cmd = "sudo dnf install -y"
+        elif shutil.which("pacman"):  # Arch Linux
+            pkg_list = "xcb-util-cursor minizip"
+            install_cmd = "sudo pacman -S --noconfirm"
+        else:                         # Debian / Ubuntu / Mint (Fallback)
+            pkg_list = "libxcb-cursor0 libminizip1"
+            install_cmd = "sudo apt-get update && sudo apt-get install -y"
 
-        missing_pkgs = sorted({pkg for _, pkg in missing})
-        missing_sonames = sorted({soname for soname, _ in missing})
-        pkg_list = " ".join(missing_pkgs)
-        soname_list = ", ".join(missing_sonames)
+        soname_list = ", ".join(s for s, p in missing)
+
+        script = (
+            f"echo 'Missing system libraries: {soname_list}'; "
+            "echo; "
+            "echo 'These packages are required to run the native GUI.'; "
+            "echo; "
+            f"echo '  {install_cmd} {pkg_list}'; "
+            "echo; "
+            "read -p 'Install now? [Y/n] ' ans; "
+            "if [ \"$ans\" = \"\" ] || [ \"$ans\" = \"y\" ] || [ \"$ans\" = \"Y\" ]; then "
+            f"  {install_cmd} {pkg_list}; "
+            "fi; "
+            "echo; "
+            "read -n1 -r -p 'Press any key to close this window...' key"
+        )
+
+        if DEBUGGING: print(f"DEBUG: Missing deps: {missing}")
 
         msg = (
             f"Missing system libraries: {soname_list}\n"
             "These packages are required to run the native GUI on Linux.\n"
-            "Install them with:\n"
-            f"  sudo apt-get update && sudo apt-get install -y {pkg_list}\n"
-            "(or equivalent for your system) Then restart this application."
+            "Install them with:\n\n"
+            f"{install_cmd} {pkg_list}\n\n"
+            "(or equivalent for your system) Then restart this application.\n"
+            "For more information visit our wiki at:\n"
+            f"{GITHUB_URL}/wiki/English#linux-1"
         )
 
         if getattr(sys, "frozen", False):
+            # prepare clean environment for terminal prompt
+            clean_env = os.environ.copy()
+            # Remove AppImage variables
+            for var in ["LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONHOME", "GIO_MODULE_DIR"]:
+                clean_env.pop(var, None)
+            # restore LD_LIBRARY_PATH origin saved by AppRun if exists
+            if "SYSTEM_LD_LIBRARY_PATH" in os.environ:
+                clean_env["LD_LIBRARY_PATH"] = os.environ["SYSTEM_LD_LIBRARY_PATH"]
             # Try to show a friendly installer prompt in a terminal first
-            script = (
-                f"echo 'Missing system libraries: {soname_list}'; "
-                "echo; "
-                "echo 'These packages are required to run the native GUI.'; "
-                "echo; "
-                f"echo '  sudo apt-get update && sudo apt-get install -y {pkg_list}'; "
-                "echo; "
-                "read -p 'Install now? [Y/n] ' ans; "
-                "if [ \"$ans\" = \"\" ] || [ \"$ans\" = \"y\" ] || [ \"$ans\" = \"Y\" ]; then "
-                f"sudo apt-get update && sudo apt-get install -y {pkg_list}; "
-                "fi; "
-                "echo; "
-                "read -n1 -r -p 'Press any key to close this window...' key"
-            )
+            clean_env = os.environ.copy()
+            for var in ["LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONHOME", "GIO_MODULE_DIR"]:
+                clean_env.pop(var, None)
+            if "SYSTEM_LD_LIBRARY_PATH" in os.environ:
+                clean_env["LD_LIBRARY_PATH"] = os.environ["SYSTEM_LD_LIBRARY_PATH"]
 
             launched = False
 
@@ -1869,7 +1998,7 @@ def check_native_runtime_deps() -> bool:
 
             for cmd in terminal_attempts:
                 try:
-                    subprocess.Popen(cmd)
+                    subprocess.Popen(cmd, env=clean_env)
                     launched = True
                     break
                 except Exception:
@@ -1895,11 +2024,18 @@ def check_native_runtime_deps() -> bool:
 
 def get_resource_path(relative_path):
     try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.dirname(os.path.abspath(__file__))
 
-    return os.path.join(base_path, relative_path)
+    # Check for PyInstaller 6+ _internal directory in onedir mode
+    path = os.path.join(base_path, relative_path)
+    if not os.path.exists(path):
+        _internal = os.path.join(base_path, "_internal", relative_path)
+        if os.path.exists(_internal):
+            return _internal
+    return path
 
 # --- MESHTASTIC DECODING LOGIC ---
 
@@ -2682,8 +2818,10 @@ def show_rtlsdr_device_error_dialog():
             translate("popup.error.rtlsdrdevice.body2", "Please connect a compatible RTL-SDR dongle and install the correct drivers for your operating system (Windows or Linux).")
         ).classes('text-sm text-gray-700 mb-1')
         ui.label(
-            translate("popup.error.rtlsdrdevice.body3", "If you need help, consult the Wiki section on the project's GitHub repository, reachable from the About menu.")
-        ).classes('text-sm text-gray-700')
+            translate("popup.error.rtlsdrdevice.body3", "If you need help, consult the Wiki section on the project's GitHub repository, reachable from the About menu.\nYou can also reach it directly by clicking here:")
+        ).classes('text-sm text-gray-700 whitespace-pre-line')
+        wikiexacturl = f"{GITHUB_URL}/wiki/English#rtl-sdr-drivers-setup-linux"
+        ui.link("Wiki-SDR-Drivers", wikiexacturl, new_tab=True).classes('text-blue-500 mb-2')
         ui.button(translate("button.close", "Close"), on_click=dlg.close).classes('w-full mt-3 bg-red-600 text-white')
     dlg.open()
 
@@ -2694,6 +2832,8 @@ def _engine_paths():
     roots = []
 
     if getattr(sys, 'frozen', False):
+        if system == "Linux" and os.environ.get('APPIMAGE'):
+            roots.append(os.path.dirname(os.environ.get('APPIMAGE')))
         exe_dir = os.path.dirname(sys.executable)
         roots.append(exe_dir)
         if system == "Darwin":
@@ -3112,7 +3252,12 @@ def start_engine_direct():
                         mesh_stats.on_frame_fail()
                     except Exception:
                         pass
-                if (not rtlsdr_notified) and ("Wrong rtlsdr device index" in line or "No supported devices found" in line):
+                if (not rtlsdr_notified) and (
+                    "Wrong rtlsdr device index" in line
+                    or "No supported devices found" in line
+                    or "failed to open rtlsdr device" in line
+                    or "not found or driver not available" in line
+                ):
                     rtlsdr_notified = True
                     state.rtlsdr_error_pending = True
                     state.rtlsdr_error_text = line
@@ -3256,11 +3401,12 @@ def _run_splash_process():
 def start_tk_splash():
     global _splash_process
     # Close Pyinstaller splash if open
-    try:
-        import pyi_splash
-        pyi_splash.close()
-    except Exception:
-        pass
+    if platform.system() == 'Windows':
+        try:
+            import pyi_splash
+            pyi_splash.close()
+        except Exception:
+            pass
     if _splash_process: return
     try:
         # Launch the splash screen in a separate process
@@ -3285,12 +3431,106 @@ def close_tk_splash():
 
 def close_all_splash():
     """Closes both the PyInstaller legacy splash and the tk cross-platform splash."""
-    close_tk_splash() 
+    close_tk_splash()
+    if platform.system() == 'Windows':
+        try:
+            import pyi_splash
+            pyi_splash.close()
+        except Exception:
+            pass
+
+def _copy_text_to_system_clipboard(text: str) -> bool:
+    """Universal clipboard copy: Windows/macOS/Linux, venv and bundled. No external deps required."""
+    system = platform.system()
+
+    # --- Windows: pure ctypes Win32, zero deps ---
+    if system == 'Windows':
+        try:
+            import ctypes
+            CF_UNICODETEXT = 13
+            GMEM_MOVEABLE  = 0x0002
+            encoded = (text + '\0').encode('utf-16-le')
+            k32 = ctypes.windll.kernel32
+            u32 = ctypes.windll.user32
+            h = k32.GlobalAlloc(GMEM_MOVEABLE, len(encoded))
+            if not h: raise OSError("GlobalAlloc failed")
+            ptr = k32.GlobalLock(h)
+            if not ptr:
+                k32.GlobalFree(h)
+                raise OSError("GlobalLock failed")
+            ctypes.memmove(ctypes.c_char_p(ptr), encoded, len(encoded))
+            k32.GlobalUnlock(h)
+            if not u32.OpenClipboard(0): raise OSError("OpenClipboard failed")
+            u32.EmptyClipboard()
+            u32.SetClipboardData(CF_UNICODETEXT, h)
+            u32.CloseClipboard()
+            return True
+        except Exception as e:
+            if DEBUGGING: print(f"DEBUG: Win32 clipboard: {e}", flush=True)
+        return False
+
+    # --- macOS: pbcopy is always present ---
+    if system == 'Darwin':
+        try:
+            subprocess.run(['pbcopy'], input=text.encode('utf-8'), check=True, timeout=3)
+            return True
+        except Exception as e:
+            if DEBUGGING: print(f"DEBUG: pbcopy: {e}", flush=True)
+        return False
+
+    # --- Linux ---
+    clean_env = os.environ.copy()
+    for var in ["LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONHOME", "GIO_MODULE_DIR"]:
+        clean_env.pop(var, None)
+
+    is_wayland = bool(os.environ.get('WAYLAND_DISPLAY'))
+    cmds = (
+        [['wl-copy'], ['xclip', '-selection', 'clipboard'], ['xsel', '--clipboard', '--input']]
+        if is_wayland else
+        [['xclip', '-selection', 'clipboard'], ['xsel', '--clipboard', '--input'], ['wl-copy']]
+    )
+    for cmd in cmds:
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                    env=clean_env, start_new_session=True)
+            proc.communicate(input=text.encode('utf-8'), timeout=3)
+            if proc.returncode == 0:
+                return True
+        except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+            continue
+
+    # Last resort: tkinter hidden window — already a dep of this app, no extras needed.
+    # We keep the root alive 30 s so X11 clipboard ownership doesn't vanish immediately.
     try:
-        import pyi_splash
-        pyi_splash.close()
-    except Exception:
-        pass
+        import tkinter as _tk
+        ready = threading.Event()
+        result = [False]
+
+        def _tk_clip():
+            try:
+                root = _tk.Tk()
+                root.withdraw()
+                root.clipboard_clear()
+                root.clipboard_append(text)
+                root.update()
+                result[0] = True
+            except Exception as ex:
+                if DEBUGGING: print(f"DEBUG: tkinter clipboard: {ex}", flush=True)
+            finally:
+                ready.set()
+            try:
+                root.after(30000, root.destroy)
+                root.mainloop()
+            except Exception:
+                pass
+
+        threading.Thread(target=_tk_clip, daemon=True).start()
+        ready.wait(timeout=2)
+        return result[0]
+    except Exception as e:
+        if DEBUGGING: print(f"DEBUG: tkinter clipboard fallback: {e}", flush=True)
+
+    return False
 
 @app.post('/shutdown_app')
 async def shutdown_app(request: Request):
@@ -3342,6 +3582,24 @@ async def set_map_center(request: Request):
     except Exception:
         pass
     return {'status': 'ignored'}
+
+@app.post('/open_url')
+async def open_url_endpoint(request: Request):
+    data = await request.json()
+    url = data.get('url')
+    if url:
+        safe_open_url(url)
+    return {'status': 'ok'}
+
+
+@app.post('/copy_to_clipboard')
+async def copy_to_clipboard_endpoint(request: Request):
+    data = await request.json()
+    text = data.get('text', '')
+    if not text:
+        return {'status': 'empty'}
+    ok = _copy_text_to_system_clipboard(text)
+    return {'status': 'ok' if ok else 'error'}
 
 # --- GUI ---
 
@@ -3436,7 +3694,120 @@ def main_page():
             top: 3px;
             cursor: inherit;
         }
+        .mesh-kpi-card {
+            container-type: inline-size;
+            container-name: kpi-card;
+        }
+        .mesh-kpi-label { font-size: 0.75rem; }
+        .mesh-kpi-icon  { font-size: 14px; }
+        .mesh-kpi-value { font-size: 1.25rem; }
+        .mesh-kpi-badge { font-size: 0.75rem; }
+
+        @container kpi-card (min-width: 160px) {
+            .mesh-kpi-label { font-size: 0.8rem; }
+            .mesh-kpi-icon  { font-size: 15px; }
+            .mesh-kpi-value { font-size: 1.35rem; }
+            .mesh-kpi-badge { font-size: 0.75rem; }
+        }
+        @container kpi-card (min-width: 200px) {
+            .mesh-kpi-label { font-size: 0.875rem; }
+            .mesh-kpi-icon  { font-size: 16px; }
+            .mesh-kpi-value { font-size: 1.5rem; }
+            .mesh-kpi-badge { font-size: 0.75rem; }
+        }
+        .nicegui-log,
+        .nicegui-log * {
+            user-select: text !important;
+            -webkit-user-select: text !important;
+            cursor: text;
+        }
         </style>
+    ''')
+    ui.add_head_html('''
+        <script>
+        // Open external links in the default browser
+        document.addEventListener('click', function(e) {
+            const link = e.target.closest('a');
+            if (link && (link.getAttribute('target') === '_blank' || link.href.includes('github.com') || link.href.includes('ko-fi.com'))) {
+                e.preventDefault();
+                fetch('/open_url', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({url: link.href})
+                });
+            }
+        }, true);
+        </script>
+    ''')
+    ui.add_head_html('''
+        <script>
+        // Right-click context menu on external links
+        (function() {
+            var _ctxMenu = null;
+            function removeMenu() {
+                if (_ctxMenu) { _ctxMenu.remove(); _ctxMenu = null; }
+            }
+            window.contextMenuT = (key, fallback) => {
+                try {
+                    if (window.mesh_i18n && window.mesh_i18n[key]) return window.mesh_i18n[key];
+                } catch (e) { }
+                return fallback ? String(fallback) : String(key || '');
+            };
+            document.addEventListener('contextmenu', function(e) {
+                const link = e.target.closest('a');
+                if (!link || !link.href || (!link.getAttribute('target') && !link.href.includes('http'))) return;
+                e.preventDefault();
+                removeMenu();
+                const label = window.contextMenuT('contextmenu.copylink', 'Copy Link');
+                const menu = document.createElement('div');
+                menu.style.cssText = 'position:fixed;z-index:99999;background:#fff;border:1px solid #ccc;border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,0.18);padding:4px 0;min-width:140px;font-size:14px;font-family:sans-serif;';
+                const item = document.createElement('div');
+                item.textContent = label;
+                item.style.cssText = 'padding:8px 18px;cursor:pointer;color:#222;';
+                item.addEventListener('mouseenter', function() { item.style.background='#f0f4ff'; });
+                item.addEventListener('mouseleave', function() { item.style.background=''; });
+                item.addEventListener('click', async function() {
+                    const ok = await window.meshCopyToClipboard(link.href);
+                    if (ok) {
+                        window.meshNotify(window.contextMenuT('notification.positive.copytext', 'Copied to clipboard'), 'positive');
+                    } else {
+                        window.meshNotify(window.contextMenuT('notification.error.copytext', 'Copy text failed'), 'negative');
+                    }
+                    removeMenu();
+                });
+                menu.appendChild(item);
+                menu.style.left = Math.min(e.clientX, window.innerWidth - 160) + 'px';
+                menu.style.top  = Math.min(e.clientY, window.innerHeight - 60) + 'px';
+                document.body.appendChild(menu);
+                _ctxMenu = menu;
+            });
+            document.addEventListener('click', removeMenu, true);
+            document.addEventListener('keydown', function(e) { if(e.key==='Escape') removeMenu(); });
+        })();
+        </script>
+    ''')
+    ui.add_head_html('''
+        <script>
+        // Suppress the cosmetic "ResizeObserver loop" console warning on Linux/pywebview.
+        // This warning is benign - it means Chromium had more ResizeObserver callbacks
+        // than it could deliver in one frame. Suppressing it does not affect functionality.
+        (function() {
+            var _origError = console.error.bind(console);
+            console.error = function() {
+                var msg = arguments[0];
+                if (typeof msg === 'string' && msg.indexOf('ResizeObserver loop') !== -1) return;
+                return _origError.apply(console, arguments);
+            };
+            // Also suppress via window error handler (Chromium reports it both ways)
+            window.addEventListener('error', function(e) {
+                if (e && e.message && e.message.indexOf('ResizeObserver loop') !== -1) {
+                    e.stopImmediatePropagation();
+                    e.preventDefault();
+                    return true;
+                }
+            }, true);
+        })();
+        </script>
     ''')
     ui.add_head_html('''
         <script>
@@ -3655,18 +4026,28 @@ def main_page():
 
         window.meshCopyToClipboard = async (text) => {
             const val = (text === null || text === undefined) ? '' : String(text);
+            // Primary: Python backend (reliable on all platforms/distros/venv/bundled)
+            try {
+                const r = await fetch('/copy_to_clipboard', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({text: val})
+                });
+                const data = await r.json();
+                if (data.status === 'ok') return true;
+            } catch (e) { }
+            // Fallback 1: navigator.clipboard (works in browsers, sometimes in webview)
             try {
                 if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
                     await navigator.clipboard.writeText(val);
                     return true;
                 }
             } catch (e) { }
+            // Fallback 2: execCommand (deprecated but last resort)
             try {
                 const ta = document.createElement('textarea');
                 ta.value = val;
-                ta.style.position = 'fixed';
-                ta.style.left = '-9999px';
-                ta.style.top = '-9999px';
+                ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0;';
                 document.body.appendChild(ta);
                 ta.focus();
                 ta.select();
@@ -4548,6 +4929,14 @@ def main_page():
             .mesh-dark *::-webkit-scrollbar-thumb:hover {
                 background: rgba(148,163,184,0.52);
             }
+            /* Stabilizza AG Grid per evitare loop di ridimensionamento */
+            .ag-root-wrapper {
+                contain: strict; /* Impedisce modifiche di layout esterne */
+            }
+            .ag-body-viewport, .ag-body-horizontal-scroll-viewport {
+                overflow-y: scroll !important;
+                overflow-x: auto !important;
+            }
         </style>
         <script>
         (function () {
@@ -4720,6 +5109,7 @@ def main_page():
     js_i18n = {
         "tooltip.openinmap.title": translate("tooltip.openinmap.title", "Click to open in map"),
         "tooltip.copytext.title": translate("tooltip.copytext.title", "Copy"),
+        "contextmenu.copylink": translate("contextmenu.copylink", "Copy Link"),
         "notification.positive.copytext": translate("notification.positive.copytext", "Copied to clipboard"),
         "notification.error.copytext": translate("notification.error.copytext", "Copy text failed"),
         "map.legend.lastheard": translate("map.legend.lastheard", "Last Heard"),
@@ -6672,6 +7062,9 @@ def main_page():
                             pass
 
                         nodes_grid = ui.aggrid({
+                            'suppressColumnVirtualisation': True,
+                            'suppressRowVirtualisation': False,
+                            'alwaysShowVerticalScroll': True,
                             'defaultColDef': {
                                 'resizable': True,
                                 'sortable': True,
@@ -6845,74 +7238,74 @@ def main_page():
                         with ui.row().classes('w-full gap-3 mb-3 flex-wrap'):
                             with ui.card().classes('p-3 w-full sm:w-[calc(50%-0.75rem)] lg:w-[calc(25%-0.75rem)]'):
                                 ui.label(translate("mesh_overview.kpi.total_packets", "Total packets")).classes('text-sm text-gray-500')
-                                kpi_total = ui.label("-").classes('text-2xl font-bold')
+                                kpi_total = ui.label("-").classes('text-2xl font-bold').props('id=mesh-kpi-total')
                             with ui.card().classes('p-3 w-full sm:w-[calc(50%-0.75rem)] lg:w-[calc(25%-0.75rem)]'):
                                 ui.label(translate("mesh_overview.kpi.ppm", "Packets/min")).classes('text-sm text-gray-500')
-                                kpi_ppm = ui.label("-").classes('text-2xl font-bold')
+                                kpi_ppm = ui.label("-").classes('text-2xl font-bold').props('id=mesh-kpi-ppm')
                             with ui.card().classes('p-3 w-full sm:w-[calc(50%-0.75rem)] lg:w-[calc(25%-0.75rem)]'):
                                 ui.label(translate("mesh_overview.kpi.active_5m", "Active nodes (5m)")).classes('text-sm text-gray-500')
-                                kpi_active_5m = ui.label("-").classes('text-2xl font-bold')
+                                kpi_active_5m = ui.label("-").classes('text-2xl font-bold').props('id=mesh-kpi-active-5m')
                             with ui.card().classes('p-3 w-full sm:w-[calc(50%-0.75rem)] lg:w-[calc(25%-0.75rem)]'):
                                 ui.label(translate("mesh_overview.kpi.error_rate", "Global error rate")).classes('text-sm text-gray-500')
-                                kpi_err = ui.label("-").classes('text-2xl font-bold')
+                                kpi_err = ui.label("-").classes('text-2xl font-bold').props('id=mesh-kpi-err')
                         with ui.row().classes('w-full gap-3 mb-2 flex-nowrap'):
-                            with ui.card().classes('p-2 sm:p-3 flex-1 min-w-0 overflow-hidden'):
+                            with ui.card().classes('p-2 sm:p-3 flex-1 min-w-0 overflow-hidden mesh-kpi-card'):
                                 with ui.row().classes('w-full items-center gap-1 flex-nowrap'):
-                                    ui.label(translate("mesh_overview.kpi.mesh_traffic", "Mesh Traffic")).classes('flex-1 basis-0 min-w-0 whitespace-nowrap overflow-hidden text-ellipsis text-[clamp(0.35rem,0.755vw,0.875rem)] text-gray-500')
-                                    ui.icon("help_outline").classes('text-sky-800 p-[2px] text-[clamp(7px,1.6vw,16px)] cursor-help select-none')
+                                    ui.label(translate("mesh_overview.kpi.mesh_traffic", "Mesh Traffic")).classes('flex-1 basis-0 min-w-0 whitespace-nowrap overflow-hidden text-ellipsis mesh-kpi-label text-gray-500')
+                                    ui.icon("help_outline").classes('text-sky-800 p-[2px] mesh-kpi-icon cursor-help select-none')
                                     ui.tooltip(translate("mesh_overview.kpi.mesh_traffic.tooltip", "0–100 score based on mesh traffic congestion.\nHigher score = less congestion.\nLabels: Excellent / Good / Fair / Poor.")).classes('whitespace-pre-line')
                                 with ui.row().classes('w-full items-center gap-2 flex-nowrap'):
-                                    mesh_traffic_value = ui.label("-").classes('text-[clamp(1.05rem,2.2vw,1.5rem)] font-bold whitespace-nowrap')
-                                    mesh_traffic_badge = ui.badge("-").classes('text-white text-[clamp(0.6rem,1vw,0.75rem)] whitespace-nowrap')
+                                    mesh_traffic_value = ui.label("-").classes('mesh-kpi-value font-bold whitespace-nowrap').props('id=mesh-traffic-value')
+                                    mesh_traffic_badge = ui.badge("-").classes('text-white mesh-kpi-badge whitespace-nowrap').props('id=mesh-traffic-badge')
 
-                            with ui.card().classes('p-2 sm:p-3 flex-1 min-w-0 overflow-hidden'):
+                            with ui.card().classes('p-2 sm:p-3 flex-1 min-w-0 overflow-hidden mesh-kpi-card'):
                                 with ui.row().classes('w-full items-center gap-1 flex-nowrap'):
-                                    ui.label(translate("mesh_overview.kpi.packet_integrity", "Packet Integrity")).classes('flex-1 basis-0 min-w-0 whitespace-nowrap overflow-hidden text-ellipsis text-[clamp(0.35rem,0.755vw,0.875rem)] text-gray-500')
-                                    ui.icon("help_outline").classes('text-sky-800 p-[2px] text-[clamp(7px,1.6vw,16px)] cursor-help select-none')
+                                    ui.label(translate("mesh_overview.kpi.packet_integrity", "Packet Integrity")).classes('flex-1 basis-0 min-w-0 whitespace-nowrap overflow-hidden text-ellipsis mesh-kpi-label text-gray-500')
+                                    ui.icon("help_outline").classes('text-sky-800 p-[2px] mesh-kpi-icon cursor-help select-none')
                                     ui.tooltip(translate("mesh_overview.kpi.packet_integrity.tooltip", "0–100 score based on packet validity.\nComputed from CRC OK / CRC Fail / Invalid Protobuf.\nLabels: Excellent / Good / Fair / Poor.")).classes('whitespace-pre-line')
                                 with ui.row().classes('w-full items-center gap-2 flex-nowrap'):
-                                    packet_integrity_value = ui.label("-").classes('text-[clamp(1.05rem,2.2vw,1.5rem)] font-bold whitespace-nowrap')
-                                    packet_integrity_badge = ui.badge("-").classes('text-white text-[clamp(0.6rem,1vw,0.75rem)] whitespace-nowrap')
+                                    packet_integrity_value = ui.label("-").classes('mesh-kpi-value font-bold whitespace-nowrap').props('id=mesh-integrity-value')
+                                    packet_integrity_badge = ui.badge("-").classes('text-white mesh-kpi-badge whitespace-nowrap').props('id=mesh-integrity-badge')
 
-                            with ui.card().classes('p-2 sm:p-3 flex-1 min-w-0 overflow-hidden'):
+                            with ui.card().classes('p-2 sm:p-3 flex-1 min-w-0 overflow-hidden mesh-kpi-card'):
                                 with ui.row().classes('w-full items-center gap-1 flex-nowrap'):
-                                    ui.label(translate("mesh_overview.kpi.mesh_signal", "Mesh Signal (RF)")).classes('flex-1 basis-0 min-w-0 whitespace-nowrap overflow-hidden text-ellipsis text-[clamp(0.35rem,0.755vw,0.875rem)] text-gray-500')
-                                    ui.icon("help_outline").classes('text-sky-800 p-[2px] text-[clamp(7px,1.6vw,16px)] cursor-help select-none')
+                                    ui.label(translate("mesh_overview.kpi.mesh_signal", "Mesh Signal (RF)")).classes('flex-1 basis-0 min-w-0 whitespace-nowrap overflow-hidden text-ellipsis mesh-kpi-label text-gray-500')
+                                    ui.icon("help_outline").classes('text-sky-800 p-[2px] mesh-kpi-icon cursor-help select-none')
                                     ui.tooltip(translate("mesh_overview.kpi.mesh_signal.tooltip", "0–100 score based on RF signal quality.\nComputed from average SNR and RSSI (direct + indirect packets).\nLabels: Excellent / Good / Fair / Poor.")).classes('whitespace-pre-line')
                                 with ui.row().classes('w-full items-center gap-2 flex-nowrap'):
-                                    mesh_signal_value = ui.label("-").classes('text-[clamp(1.05rem,2.2vw,1.5rem)] font-bold whitespace-nowrap')
-                                    mesh_signal_badge = ui.badge("-").classes('text-white text-[clamp(0.6rem,1vw,0.75rem)] whitespace-nowrap')
+                                    mesh_signal_value = ui.label("-").classes('mesh-kpi-value font-bold whitespace-nowrap').props('id=mesh-signal-value')
+                                    mesh_signal_badge = ui.badge("-").classes('text-white mesh-kpi-badge whitespace-nowrap').props('id=mesh-signal-badge')
 
-                            with ui.card().classes('p-2 sm:p-3 flex-1 min-w-0 overflow-hidden'):
+                            with ui.card().classes('p-2 sm:p-3 flex-1 min-w-0 overflow-hidden mesh-kpi-card'):
                                 with ui.row().classes('w-full items-center gap-1 flex-nowrap'):
-                                    ui.label(translate("mesh_overview.kpi.mesh_health", "Mesh Health (Global)")).classes('flex-1 basis-0 min-w-0 whitespace-nowrap overflow-hidden text-ellipsis text-[clamp(0.35rem,0.755vw,0.875rem)] text-gray-500')
-                                    ui.icon("help_outline").classes('text-sky-800 p-[2px] text-[clamp(7px,1.6vw,16px)] cursor-help select-none')
+                                    ui.label(translate("mesh_overview.kpi.mesh_health", "Mesh Health (Global)")).classes('flex-1 basis-0 min-w-0 whitespace-nowrap overflow-hidden text-ellipsis mesh-kpi-label text-gray-500')
+                                    ui.icon("help_outline").classes('text-sky-800 p-[2px] mesh-kpi-icon cursor-help select-none')
                                     ui.tooltip(translate("mesh_overview.kpi.mesh_health.tooltip", "0–100 score computed as the arithmetic mean of Mesh Traffic, Packet Integrity and Mesh Signal.\nLabels: Stable / Intermittent / Unstable / Critical.")).classes('whitespace-pre-line')
                                 with ui.row().classes('w-full items-center gap-2 flex-nowrap'):
-                                    mesh_health_value = ui.label("-").classes('text-[clamp(1.05rem,2.2vw,1.5rem)] font-bold whitespace-nowrap')
-                                    mesh_health_badge = ui.badge("-").classes('text-white text-[clamp(0.6rem,1vw,0.75rem)] whitespace-nowrap')
+                                    mesh_health_value = ui.label("-").classes('mesh-kpi-value font-bold whitespace-nowrap').props('id=mesh-health-value')
+                                    mesh_health_badge = ui.badge("-").classes('text-white mesh-kpi-badge whitespace-nowrap').props('id=mesh-health-badge')
 
                         ui.label(translate("mesh_overview.quality.note", "Note: 1–3 hours of listening are recommended for a more stable overview.")).classes('text-xs text-gray-500 mb-3')
 
-                        traffic_graph = ui.element('div').classes('w-full mb-3')
+                        traffic_graph = ui.element('div').classes('w-full mb-3').props('id=mesh-traffic-graph')
 
                         with ui.row().classes('w-full gap-3 mb-3 flex-wrap'):
                             with ui.card().classes('p-3 w-full md:w-[calc(50%-0.75rem)]'):
                                 ui.label(translate("mesh_overview.section.integrity", "Packet Integrity")).classes('text-lg font-semibold mb-2')
-                                integrity_crc_ok = ui.label("-").classes('text-sm')
-                                integrity_crc_fail = ui.label("-").classes('text-sm')
-                                integrity_dec_ok = ui.label("-").classes('text-sm')
-                                integrity_dec_fail = ui.label("-").classes('text-sm')
-                                integrity_pb = ui.label("-").classes('text-sm')
-                                integrity_port = ui.label("-").classes('text-sm')
+                                integrity_crc_ok = ui.label("-").classes('text-sm').props('id=mesh-integrity-crc-ok')
+                                integrity_crc_fail = ui.label("-").classes('text-sm').props('id=mesh-integrity-crc-fail')
+                                integrity_dec_ok = ui.label("-").classes('text-sm').props('id=mesh-integrity-dec-ok')
+                                integrity_dec_fail = ui.label("-").classes('text-sm').props('id=mesh-integrity-dec-fail')
+                                integrity_pb = ui.label("-").classes('text-sm').props('id=mesh-integrity-pb')
+                                integrity_port = ui.label("-").classes('text-sm').props('id=mesh-integrity-port')
 
                             with ui.card().classes('p-3 w-full md:w-[calc(50%-0.75rem)]'):
                                 ui.label(translate("mesh_overview.section.rf", "RF Quality (recent)")).classes('text-lg font-semibold mb-2')
-                                rf_rssi = ui.label("-").classes('text-sm')
-                                rf_snr = ui.label("-").classes('text-sm')
-                                rf_direct = ui.label("-").classes('text-sm')
-                                rf_multihop = ui.label("-").classes('text-sm')
-                                rf_hopavg = ui.label("-").classes('text-sm pb-9')
+                                rf_rssi = ui.label("-").classes('text-sm').props('id=mesh-rf-rssi')
+                                rf_snr = ui.label("-").classes('text-sm').props('id=mesh-rf-snr')
+                                rf_direct = ui.label("-").classes('text-sm').props('id=mesh-rf-direct')
+                                rf_multihop = ui.label("-").classes('text-sm').props('id=mesh-rf-multihop')
+                                rf_hopavg = ui.label("-").classes('text-sm pb-9').props('id=mesh-rf-hopavg')
 
                         top_node_state = {"id": None}
 
@@ -6924,18 +7317,18 @@ def main_page():
                         with ui.row().classes('w-full gap-3 mb-3 flex-wrap'):
                             with ui.card().classes('p-3 w-full'):
                                 ui.label(translate("mesh_overview.section.activity", "Mesh Activity")).classes('text-lg font-semibold mb-2')
-                                act_active_10m = ui.label("-").classes('text-sm')
-                                act_new_hour = ui.label("-").classes('text-sm')
-                                act_cu = ui.label("-").classes('text-sm')
-                                act_private_msgs = ui.label("-").classes('text-sm')
+                                act_active_10m = ui.label("-").classes('text-sm').props('id=mesh-act-active-10m')
+                                act_new_hour = ui.label("-").classes('text-sm').props('id=mesh-act-new-hour')
+                                act_cu = ui.label("-").classes('text-sm').props('id=mesh-act-cu')
+                                act_private_msgs = ui.label("-").classes('text-sm').props('id=mesh-act-private')
                                 ui.separator().classes('my-2')
                                 ui.label(translate("mesh_overview.section.single_node_activity", "Single node activity")).classes('text-sm font-semibold text-gray-600')
                                 with ui.row().classes('w-full items-center gap-1'):
-                                    act_top_node_prefix = ui.label("-").classes('text-sm')
-                                    act_top_node_id = ui.label("-").classes('text-sm')
-                                    act_top_node_cnt = ui.label("").classes('text-sm')
+                                    act_top_node_prefix = ui.label("-").classes('text-sm').props('id=mesh-act-top-prefix')
+                                    act_top_node_id = ui.label("-").classes('text-sm').props('id=mesh-act-top-id')
+                                    act_top_node_cnt = ui.label("").classes('text-sm').props('id=mesh-act-top-cnt')
                                 act_top_node_id.on('click', lambda _e: _filter_top_node())
-                                act_au = ui.label("-").classes('text-sm')
+                                act_au = ui.label("-").classes('text-sm').props('id=mesh-act-au')
 
                         with ui.row().classes('w-full justify-end gap-2'):
                             with ui.dialog() as reset_stats_dialog:
@@ -7007,92 +7400,150 @@ def main_page():
                             snap = mesh_stats.snapshot()
                             series = mesh_stats.sample_packets_per_minute()
 
-                            kpi_total.text = _fmt_num(snap.get("total_packets"))
-                            kpi_ppm.text = _fmt_num(snap.get("packets_per_minute"))
-                            kpi_active_5m.text = _fmt_num(snap.get("active_nodes_5m"))
-                            kpi_err.text = f"{_fmt_num(snap.get('global_error_rate_pct'), 1)}%"
+                            # Build a single payload and update everything client-side in one JS call
+                            # to avoid dozens of separate WebSocket DOM patches per second, which
+                            # trigger ResizeObserver loops in AG Grid / Quasar on Linux/pywebview.
+                            def _level_color(col):
+                                return {
+                                    'green':  '!bg-green-600 !text-white',
+                                    'yellow': '!bg-yellow-600 !text-white',
+                                    'orange': '!bg-orange-600 !text-white',
+                                    'red':    '!bg-red-600 !text-white',
+                                }.get(str(col or ''), '')
 
-                            traffic_graph._props['innerHTML'] = _sparkline_svg(series)
-                            traffic_graph.update()
+                            _aes_b64 = (getattr(state, 'aes_key_b64', '') or '').strip()
+                            _df = int(snap.get('decrypt_fail') or 0)
+                            _do = int(snap.get('decrypt_ok') or 0)
+                            _den = _do + _df
+                            _pct = (float(_df) / float(_den) * 100.0) if _den > 0 else 0.0
+                            _show_private = _aes_b64 == 'AQ=='
 
-                            integrity_crc_ok.text = translate("mesh_overview.integrity.crc_ok", "CRC OK: {v}").format(v=_fmt_num(snap.get("crc_ok")))
-                            integrity_crc_fail.text = translate("mesh_overview.integrity.crc_fail", "CRC Fail: {v}").format(v=_fmt_num(snap.get("crc_fail")))
-                            integrity_dec_ok.text = translate("mesh_overview.integrity.decrypt_ok", "Decrypt OK: {v}").format(v=_fmt_num(snap.get("decrypt_ok")))
-                            integrity_dec_fail.text = translate("mesh_overview.integrity.decrypt_fail", "Decrypt Fail: {v}").format(v=_fmt_num(snap.get("decrypt_fail")))
-                            integrity_pb.text = translate("mesh_overview.integrity.invalid_protobuf", "Invalid protobuf: {v}").format(v=_fmt_num(snap.get("invalid_protobuf")))
-                            integrity_port.text = translate("mesh_overview.integrity.unknown_portnum", "Unknown portnum: {v}").format(v=_fmt_num(snap.get("unknown_portnum")))
+                            _nid = snap.get('most_active_node')
 
-                            rf_rssi.text = translate("mesh_overview.rf.rssi_avg", "Avg RSSI: {v}").format(v=_fmt_num(snap.get("rssi_avg"), 1))
-                            rf_snr.text = translate("mesh_overview.rf.snr_avg", "Avg SNR: {v}").format(v=_fmt_num(snap.get("snr_avg"), 1))
-                            rf_direct.text = translate("mesh_overview.rf.direct_pct", "Direct packets: {v}%").format(v=_fmt_num(snap.get("direct_ratio_pct"), 1))
-                            rf_multihop.text = translate("mesh_overview.rf.multihop_pct", "Multi-hop packets: {v}%").format(v=_fmt_num(snap.get("multihop_ratio_pct"), 1))
-                            rf_hopavg.text = translate("mesh_overview.rf.hop_avg", "Avg hops: {v}").format(v=_fmt_num(snap.get("hop_avg"), 2))
+                            badge_classes = 'bg-primary bg-blue-600 bg-sky-600 bg-green-600 bg-yellow-600 bg-orange-600 bg-red-600 !bg-green-600 !bg-yellow-600 !bg-orange-600 !bg-red-600'
 
-                            act_active_10m.text = translate("mesh_overview.activity.active_10m", "Active nodes (10m): {v}").format(v=_fmt_num(snap.get("active_nodes_10m")))
-                            act_new_hour.text = translate("mesh_overview.activity.new_nodes_hour", "New nodes/hour: {v}").format(v=_fmt_num(snap.get("new_nodes_last_hour")))
-                            top_node_state["id"] = snap.get("most_active_node")
-                            act_top_node_prefix.text = translate("mesh_overview.activity.top_node.prefix", "Most active:")
-                            _nid = top_node_state["id"]
-                            act_top_node_id.text = str(_nid or "-")
-                            act_top_node_cnt.text = translate("mesh_overview.activity.top_node.count", "({cnt})").format(
-                                cnt=_fmt_num(snap.get("most_active_node_packets"))
-                            ) if _nid else ""
-                            if _nid:
-                                act_top_node_id.classes(add="text-blue-600 underline cursor-pointer select-none", remove="text-gray-600 cursor-default")
-                            else:
-                                act_top_node_id.classes(add="text-gray-600 cursor-default select-none", remove="text-blue-600 underline cursor-pointer")
-                            act_cu.text = translate("mesh_overview.activity.channel_util_avg", "Avg channel_utilization: {v}").format(v=_fmt_num(snap.get("channel_utilization_avg"), 1))
-                            _aes_b64 = (getattr(state, "aes_key_b64", "") or "").strip()
-                            if _aes_b64 == "AQ==":
-                                _df = int(snap.get("decrypt_fail") or 0)
-                                _do = int(snap.get("decrypt_ok") or 0)
-                                _den = _do + _df
-                                _pct = (float(_df) / float(_den) * 100.0) if _den > 0 else 0.0
-                                act_private_msgs.text = translate(
-                                    "mesh_overview.activity.private_messages",
-                                    "Private messages/Channels (est.): {v} ({pct}%)",
-                                ).format(v=_fmt_num(_df), pct=_fmt_num(_pct, 1))
-                                act_private_msgs.classes(remove="hidden")
-                            else:
-                                act_private_msgs.classes(add="hidden")
-                            act_au.text = translate("mesh_overview.activity.air_util_tx_max", "Peak Node Transmission: {v}%").format(v=_fmt_num(snap.get("air_util_tx_max"), 1))
+                            payload = {
+                                'svg': _sparkline_svg(series),
+                                'kpi_total': _fmt_num(snap.get('total_packets')),
+                                'kpi_ppm': _fmt_num(snap.get('packets_per_minute')),
+                                'kpi_active_5m': _fmt_num(snap.get('active_nodes_5m')),
+                                'kpi_err': f"{_fmt_num(snap.get('global_error_rate_pct'), 1)}%",
+                                'integrity_crc_ok':   translate('mesh_overview.integrity.crc_ok',   'CRC OK: {v}').format(v=_fmt_num(snap.get('crc_ok'))),
+                                'integrity_crc_fail': translate('mesh_overview.integrity.crc_fail',  'CRC Fail: {v}').format(v=_fmt_num(snap.get('crc_fail'))),
+                                'integrity_dec_ok':   translate('mesh_overview.integrity.decrypt_ok','Decrypt OK: {v}').format(v=_fmt_num(snap.get('decrypt_ok'))),
+                                'integrity_dec_fail': translate('mesh_overview.integrity.decrypt_fail','Decrypt Fail: {v}').format(v=_fmt_num(snap.get('decrypt_fail'))),
+                                'integrity_pb':       translate('mesh_overview.integrity.invalid_protobuf','Invalid protobuf: {v}').format(v=_fmt_num(snap.get('invalid_protobuf'))),
+                                'integrity_port':     translate('mesh_overview.integrity.unknown_portnum','Unknown portnum: {v}').format(v=_fmt_num(snap.get('unknown_portnum'))),
+                                'rf_rssi':    translate('mesh_overview.rf.rssi_avg',   'Avg RSSI: {v}').format(v=_fmt_num(snap.get('rssi_avg'), 1)),
+                                'rf_snr':     translate('mesh_overview.rf.snr_avg',    'Avg SNR: {v}').format(v=_fmt_num(snap.get('snr_avg'), 1)),
+                                'rf_direct':  translate('mesh_overview.rf.direct_pct', 'Direct packets: {v}%').format(v=_fmt_num(snap.get('direct_ratio_pct'), 1)),
+                                'rf_multihop':translate('mesh_overview.rf.multihop_pct','Multi-hop packets: {v}%').format(v=_fmt_num(snap.get('multihop_ratio_pct'), 1)),
+                                'rf_hopavg':  translate('mesh_overview.rf.hop_avg',    'Avg hops: {v}').format(v=_fmt_num(snap.get('hop_avg'), 2)),
+                                'act_active_10m': translate('mesh_overview.activity.active_10m','Active nodes (10m): {v}').format(v=_fmt_num(snap.get('active_nodes_10m'))),
+                                'act_new_hour':   translate('mesh_overview.activity.new_nodes_hour','New nodes/hour: {v}').format(v=_fmt_num(snap.get('new_nodes_last_hour'))),
+                                'act_top_node_prefix': translate('mesh_overview.activity.top_node.prefix','Most active:'),
+                                'act_top_node_id':  str(_nid or '-'),
+                                'act_top_node_cnt': translate('mesh_overview.activity.top_node.count','({cnt})').format(cnt=_fmt_num(snap.get('most_active_node_packets'))) if _nid else '',
+                                'act_top_node_clickable': bool(_nid),
+                                'act_cu':  translate('mesh_overview.activity.channel_util_avg','Avg channel_utilization: {v}').format(v=_fmt_num(snap.get('channel_utilization_avg'), 1)),
+                                'act_au':  translate('mesh_overview.activity.air_util_tx_max','Peak Node Transmission: {v}%').format(v=_fmt_num(snap.get('air_util_tx_max'), 1)),
+                                'show_private': _show_private,
+                                'act_private_msgs': translate('mesh_overview.activity.private_messages','Private messages/Channels (est.): {v} ({pct}%)').format(v=_fmt_num(_df), pct=_fmt_num(_pct, 1)) if _show_private else '',
+                                'mesh_traffic_value': _fmt_num(snap.get('mesh_traffic_score')),
+                                'mesh_traffic_badge': translate(f"mesh_overview.level.{snap.get('mesh_traffic_level') or ''}", (str(snap.get('mesh_traffic_level') or '') or '-').title()),
+                                'mesh_traffic_color': _level_color(snap.get('mesh_traffic_color')),
+                                'packet_integrity_value': _fmt_num(snap.get('packet_integrity_score')),
+                                'packet_integrity_badge': translate(f"mesh_overview.level.{snap.get('packet_integrity_level') or ''}", (str(snap.get('packet_integrity_level') or '') or '-').title()),
+                                'packet_integrity_color': _level_color(snap.get('packet_integrity_color')),
+                                'mesh_signal_value': _fmt_num(snap.get('mesh_signal_score')),
+                                'mesh_signal_badge': translate(f"mesh_overview.level.{snap.get('mesh_signal_level') or ''}", (str(snap.get('mesh_signal_level') or '') or '-').title()),
+                                'mesh_signal_color': _level_color(snap.get('mesh_signal_color')),
+                                'mesh_health_value': _fmt_num(snap.get('mesh_health_score')),
+                                'mesh_health_badge': translate(f"mesh_overview.health.{snap.get('mesh_health_level') or ''}", (str(snap.get('mesh_health_level') or '') or '-').title()),
+                                'mesh_health_color': _level_color(snap.get('mesh_health_color')),
+                                'badge_remove_classes': badge_classes,
+                                'top_node_id_ref': str(top_node_state.get('id') or ''),
+                            }
+                            top_node_state['id'] = _nid
 
-                            def _set_badge_color(badge, col: str):
-                                badge.classes(
-                                    remove="bg-primary bg-blue-600 bg-sky-600 bg-green-600 bg-yellow-600 bg-orange-600 bg-red-600 !bg-green-600 !bg-yellow-600 !bg-orange-600 !bg-red-600"
-                                )
-                                if col == "green":
-                                    badge.classes(add="!bg-green-600 !text-white")
-                                elif col == "yellow":
-                                    badge.classes(add="!bg-yellow-600 !text-white")
-                                elif col == "orange":
-                                    badge.classes(add="!bg-orange-600 !text-white")
-                                elif col == "red":
-                                    badge.classes(add="!bg-red-600 !text-white")
+                            ui.run_javascript(f'''
+                            (function(d) {{
+                                // SVG graph
+                                var tg = document.getElementById('mesh-traffic-graph');
+                                if (tg) tg.innerHTML = d.svg;
 
-                            mesh_traffic_value.text = _fmt_num(snap.get("mesh_traffic_score"))
-                            mt_level = str(snap.get("mesh_traffic_level") or "")
-                            mesh_traffic_badge.text = translate(f"mesh_overview.level.{mt_level}", mt_level.title()) if mt_level else "-"
-                            mt_col = str(snap.get("mesh_traffic_color") or "")
-                            _set_badge_color(mesh_traffic_badge, mt_col)
+                                // KPI labels
+                                var els = {{
+                                    'mesh-kpi-total':       d.kpi_total,
+                                    'mesh-kpi-ppm':         d.kpi_ppm,
+                                    'mesh-kpi-active-5m':   d.kpi_active_5m,
+                                    'mesh-kpi-err':         d.kpi_err,
+                                    'mesh-integrity-crc-ok':   d.integrity_crc_ok,
+                                    'mesh-integrity-crc-fail': d.integrity_crc_fail,
+                                    'mesh-integrity-dec-ok':   d.integrity_dec_ok,
+                                    'mesh-integrity-dec-fail': d.integrity_dec_fail,
+                                    'mesh-integrity-pb':       d.integrity_pb,
+                                    'mesh-integrity-port':     d.integrity_port,
+                                    'mesh-rf-rssi':    d.rf_rssi,
+                                    'mesh-rf-snr':     d.rf_snr,
+                                    'mesh-rf-direct':  d.rf_direct,
+                                    'mesh-rf-multihop':d.rf_multihop,
+                                    'mesh-rf-hopavg':  d.rf_hopavg,
+                                    'mesh-act-active-10m': d.act_active_10m,
+                                    'mesh-act-new-hour':   d.act_new_hour,
+                                    'mesh-act-top-prefix': d.act_top_node_prefix,
+                                    'mesh-act-top-id':     d.act_top_node_id,
+                                    'mesh-act-top-cnt':    d.act_top_node_cnt,
+                                    'mesh-act-cu':         d.act_cu,
+                                    'mesh-act-au':         d.act_au,
+                                    'mesh-act-private':    d.act_private_msgs,
+                                    'mesh-traffic-value':       d.mesh_traffic_value,
+                                    'mesh-traffic-badge':       d.mesh_traffic_badge,
+                                    'mesh-integrity-value':     d.packet_integrity_value,
+                                    'mesh-integrity-badge':     d.packet_integrity_badge,
+                                    'mesh-signal-value':        d.mesh_signal_value,
+                                    'mesh-signal-badge':        d.mesh_signal_badge,
+                                    'mesh-health-value':        d.mesh_health_value,
+                                    'mesh-health-badge':        d.mesh_health_badge,
+                                }};
+                                for (var id in els) {{
+                                    var el = document.getElementById(id);
+                                    if (el && el.textContent !== els[id]) el.textContent = els[id];
+                                }}
 
-                            packet_integrity_value.text = _fmt_num(snap.get("packet_integrity_score"))
-                            pi_level = str(snap.get("packet_integrity_level") or "")
-                            packet_integrity_badge.text = translate(f"mesh_overview.level.{pi_level}", pi_level.title()) if pi_level else "-"
-                            pi_col = str(snap.get("packet_integrity_color") or "")
-                            _set_badge_color(packet_integrity_badge, pi_col)
+                                // Badge colors
+                                var badgeRemove = d.badge_remove_classes.split(' ');
+                                [
+                                    ['mesh-traffic-badge',    d.mesh_traffic_color],
+                                    ['mesh-integrity-badge',  d.packet_integrity_color],
+                                    ['mesh-signal-badge',     d.mesh_signal_color],
+                                    ['mesh-health-badge',     d.mesh_health_color],
+                                ].forEach(function(pair) {{
+                                    var el = document.getElementById(pair[0]);
+                                    if (!el) return;
+                                    el.classList.remove.apply(el.classList, badgeRemove);
+                                    if (pair[1]) pair[1].split(' ').forEach(function(c) {{ if (c) el.classList.add(c); }});
+                                }});
 
-                            mesh_signal_value.text = _fmt_num(snap.get("mesh_signal_score"))
-                            ms_level = str(snap.get("mesh_signal_level") or "")
-                            mesh_signal_badge.text = translate(f"mesh_overview.level.{ms_level}", ms_level.title()) if ms_level else "-"
-                            ms_col = str(snap.get("mesh_signal_color") or "")
-                            _set_badge_color(mesh_signal_badge, ms_col)
+                                // Top node clickable state
+                                var topEl = document.getElementById('mesh-act-top-id');
+                                if (topEl) {{
+                                    if (d.act_top_node_clickable) {{
+                                        topEl.classList.add('text-blue-600', 'underline', 'cursor-pointer');
+                                        topEl.classList.remove('text-gray-600', 'cursor-default');
+                                    }} else {{
+                                        topEl.classList.add('text-gray-600', 'cursor-default');
+                                        topEl.classList.remove('text-blue-600', 'underline', 'cursor-pointer');
+                                    }}
+                                }}
 
-                            mesh_health_value.text = _fmt_num(snap.get("mesh_health_score"))
-                            mh_level = str(snap.get("mesh_health_level") or "")
-                            mesh_health_badge.text = translate(f"mesh_overview.health.{mh_level}", mh_level.title()) if mh_level else "-"
-                            mh_col = str(snap.get("mesh_health_color") or "")
-                            _set_badge_color(mesh_health_badge, mh_col)
+                                // Private messages visibility
+                                var pmEl = document.getElementById('mesh-act-private');
+                                if (pmEl) {{
+                                    pmEl.style.display = d.show_private ? '' : 'none';
+                                }}
+                            }})({json.dumps(payload)});
+                            ''')
 
                         ui.timer(1.0, _update_mesh_overview)
         
@@ -7131,7 +7582,7 @@ def main_page():
                             row.addEventListener('wheel', function(e) {
                                 if (e.deltaY !== 0) { e.preventDefault(); row.scrollLeft += e.deltaY * 0.8; }
                             }, {passive: false});
-                            new MutationObserver(update).observe(row, {childList: true, subtree: true});
+                            new MutationObserver(function() { requestAnimationFrame(update); }).observe(row, {childList: true, subtree: true});
                             update();
                         }
                         initTabsScroll();
@@ -7646,7 +8097,7 @@ def main_page():
                         state.new_logs.clear()
                         for l in batch:
                             if _log_needs_spacer(l):
-                                log_view.push("\u200b")
+                                log_view.push('\u200b')
                             log_view.push(l)
 
 
@@ -7808,6 +8259,11 @@ def _detect_window_size():
         return base_w, base_h
 
 if __name__ in {"__main__", "__mp_main__"}:
+    if sys.platform.startswith("linux"):
+        try:
+            multiprocessing.set_start_method("spawn", force=True)
+        except RuntimeError:
+            pass
     # Mandatory for PyInstaller on macOS/Linux to prevent infinite spawn loop
     multiprocessing.freeze_support()
 
@@ -7879,6 +8335,8 @@ if __name__ in {"__main__", "__mp_main__"}:
             sys.exit(1)
         
         if multiprocessing.current_process().name == 'MainProcess':
+            if _NOGPU_REQUESTED:
+                print(f"[{PROGRAM_NAME}] Software rendering mode active (--nogpu). GPU/hardware acceleration is disabled.", flush=True)
             print(f"{PROGRAM_NAME} started.", flush=True)
             start_tk_splash()
             
@@ -7950,6 +8408,12 @@ if __name__ in {"__main__", "__mp_main__"}:
             if system == "Linux":
                 os.environ['LANG'] = 'C.UTF-8'
                 os.environ['LC_ALL'] = 'C.UTF-8'
+
+                os.environ["GSETTINGS_BACKEND"] = "memory"
+                os.environ["QT_QPA_PLATFORMTHEME"] = "fusion"
+                os.environ["QT_VIDEO_BACKEND"] = "dummy"
+                os.environ["TK_SILENCE_DEPRECATION"] = "1"
+                os.environ["PYWEBVIEW_GUI"] = "qt"
 
                 # 2. mute qt video driver logging
                 os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.qpa.*=false'
@@ -8057,19 +8521,30 @@ if __name__ in {"__main__", "__mp_main__"}:
                         os.environ['QT_QUICK_BACKEND'] = 'software'
                 try:
                     app.native.start_args['gui'] = 'qt'
+
+
+                    # Fix DPI mismatch Qt/Chromium on X11 (root cause of ResizeObserver loops)
+                    _existing = os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS', '')
+                    if '--force-device-scale-factor' not in _existing:
+                        os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = (
+                            _existing + ' --force-device-scale-factor=1 --disable-features=LayoutNG,CalculateNativeWinOcclusion'
+                        ).strip()
                 except Exception:
                     pass
 
             # Use bundled icon (SVG, supported as NiceGUI favicon)
-            icon_path = get_resource_path('app_icon.svg')
-            
+            if system == "Linux" and getattr(sys, 'frozen', False):
+                icon_path_for_favicon = get_resource_path('app_icon.png')
+            else:
+                icon_path_for_favicon = get_resource_path('app_icon.svg')
+
             # Native mode arguments for better compatibility
             # macOS often needs specific flags to avoid crashes (e.g. reload=False is crucial)
             # Linux GTK can also be picky.
             win_w, win_h = _detect_window_size()
             ui.run(
                 title=f'{PROGRAM_NAME} - {PROGRAM_SHORT_DESC} v{VERSION} By {AUTHOR}', 
-                favicon=icon_path, 
+                favicon=icon_path_for_favicon, 
                 native=True, 
                 host='127.0.0.1',
                 reload=False, # Important for stability in native mode

@@ -134,13 +134,7 @@ download_micromamba_if_needed() {
 build_env() {
   echo "Building the environment..."
   "$MM" create -p "$ENV_PATH" -c conda-forge -c ryanvolz \
-    nomkl \
-    python=3.10 \
-    gnuradio-osmosdr \
-    gnuradio-lora_sdr \
-    rtl-sdr \
-    libusb \
-    numpy \
+    --file "./lock-macos-$(uname -m).yml" \
     --yes
 }
 
@@ -351,3 +345,12 @@ clean_micromamba_cache
 echo "Done."
 
 echo "Done, now you can use the internal radio of the app."
+
+# Note dev to recreate the lock file (only after testing on libraries to be excluded)
+# Create our basic env with:
+# ./micromamba create -f linuxenv.yml -p ./runtime
+# (which is not a lock file)
+# Then create the lock file with:
+# ./micromamba env export -p ./runtime > lock-macos-x86_64.yml
+# Then open the file and remove the entire "pip" section if present (contamination) 
+#   with all the contents, also remove "prefix" and put "runtime" as the name, save, done.
